@@ -20,11 +20,13 @@ class ModelLoader:
         self,
         device: str | torch.device | None = None,
         registry: ArchRegistry = MAIN_REGISTRY,
+        cuda_graph_compatible: bool = False,
     ):
         if isinstance(device, str):
             device = torch.device(device)
         self.device: torch.device = device or torch.device("cpu")
         self.registry: ArchRegistry = registry
+        self.cuda_graph_compatible: bool = cuda_graph_compatible
         """
         The architecture registry to use for loading models.
 
@@ -91,7 +93,14 @@ class ModelLoader:
         Throws an `UnsupportedModelError` if the model architecture is not supported.
         """
 
-        return self.registry.load(state_dict).to(self.device)
+        model = self.registry.load(state_dict).to(self.device)
+        
+        # Prepare model for CUDA graph compatibility if requested
+        if self.cuda_graph_compatible:
+            model.prepare_for_inference()
+            # TODO: Add warning about architectures with known incompatibilities
+            
+        return model
 
     def _load_pth(self, path: str | Path) -> StateDict:
         return torch.load(

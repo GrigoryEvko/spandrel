@@ -68,6 +68,44 @@ model = spandrel.ModelLoader().load_from_file(r"path/to/model.pth")
 ... # use model
 ```
 
+### CUDA Graph Compatibility and torch.compile
+
+Spandrel now includes utilities to make models compatible with `torch.compile` and CUDA graphs. By default, Spandrel's `ImageModelDescriptor` uses `@torch.inference_mode()` which is incompatible with CUDA graph capture. Here's how to use models with torch.compile:
+
+```python
+from spandrel import ModelLoader, make_cuda_graph_compatible
+
+# Load with CUDA graph compatibility mode
+model = ModelLoader(cuda_graph_compatible=True).load_from_file(r"path/to/model.pth")
+model.cuda().eval()
+
+# Or prepare an existing model
+model = make_cuda_graph_compatible(model)
+
+# Compile the model
+import torch
+compiled_model = torch.compile(model.model, mode='reduce-overhead')
+
+# Use the compiled model directly
+output = compiled_model(input_tensor)
+```
+
+For maximum compatibility, you can also use the provided utilities:
+
+```python
+from spandrel import compile_with_best_settings, wrap_for_cuda_graphs
+
+# Wrap the model for CUDA graphs (removes inference_mode context)
+wrapped_model = wrap_for_cuda_graphs(model)
+
+# Compile with optimized settings
+compiled = compile_with_best_settings(wrapped_model, mode='reduce-overhead')
+```
+
+**Note:** Some architectures have known compatibility issues with torch.compile:
+- **Incompatible:** OmniSR, GFPGAN, CodeFormer (contain custom autograd functions)
+- **Limited compatibility:** Models with DySample, SPAN, PLKSR (require fixed input sizes)
+
 ## Supported File Types
 
 Spandrel mainly supports loading `.pth` files for all supported architectures. This is what you will typically find from official repos and community trained models. However, Spandrel also supports loading TorchScript traced models (`.pt`), certain types of `.ckpt` files, and `.safetensors` files for any supported architecture saved in one of these formats.

@@ -5,6 +5,11 @@ Spandrel is a library for loading and running pre-trained PyTorch models. It aut
 __version__ = "0.4.1"
 
 from .__helpers.canonicalize import canonicalize_state_dict
+from .__helpers.cuda_compat import (
+    compile_with_best_settings,
+    make_cuda_graph_compatible,
+    wrap_for_cuda_graphs,
+)
 from .__helpers.loader import ModelLoader
 from .__helpers.main_registry import MAIN_REGISTRY
 from .__helpers.model_descriptor import (
@@ -33,9 +38,11 @@ __all__ = [
     "ArchRegistry",
     "ArchSupport",
     "canonicalize_state_dict",
+    "compile_with_best_settings",
     "DuplicateArchitectureError",
     "ImageModelDescriptor",
     "MAIN_REGISTRY",
+    "make_cuda_graph_compatible",
     "MaskedImageModelDescriptor",
     "ModelBase",
     "ModelDescriptor",
@@ -46,4 +53,5 @@ __all__ = [
     "StateDict",
     "UnsupportedDtypeError",
     "UnsupportedModelError",
+    "wrap_for_cuda_graphs",
 ]

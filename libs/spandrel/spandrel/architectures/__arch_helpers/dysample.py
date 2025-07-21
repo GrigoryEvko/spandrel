@@ -16,6 +16,7 @@ class DySample(nn.Module):
         scale: int = 2,
         groups: int = 4,
         end_convolution: bool = True,
+        max_size: int = 2048,  # Maximum expected input size for CUDA graph compatibility
     ):
         super().__init__()
 
@@ -29,6 +30,7 @@ class DySample(nn.Module):
         self.scale = scale
         self.groups = groups
         self.end_convolution = end_convolution
+        self.max_size = max_size
         if end_convolution:
             self.end_conv = nn.Conv2d(in_channels, out_ch, kernel_size=1)
 
@@ -39,6 +41,9 @@ class DySample(nn.Module):
             nn.init.constant_(self.scope.weight, val=0)
 
         self.register_buffer("init_pos", self._init_pos())
+        
+        # Pre-compute coordinate grids for CUDA graph compatibility
+        self._precompute_coords()
 
     def _init_pos(self):
         h = torch.arange((-self.scale + 1) / 2, (self.scale - 1) / 2 + 1) / self.scale
@@ -48,14 +53,25 @@ class DySample(nn.Module):
             .repeat(1, self.groups, 1)
             .reshape(1, -1, 1, 1)
         )
+    
+    def _precompute_coords(self):
+        """Pre-compute coordinate grids for different sizes to support CUDA graphs."""
+        # Pre-compute coordinate ranges for maximum expected size
+        coords_h = torch.arange(self.max_size, dtype=torch.float32) + 0.5
+        coords_w = torch.arange(self.max_size, dtype=torch.float32) + 0.5
+        self.register_buffer("_coords_h", coords_h)
+        self.register_buffer("_coords_w", coords_w)
 
     def forward(self, x):
         offset = self.offset(x) * self.scope(x).sigmoid() * 0.5 + self.init_pos
         B, _, H, W = offset.shape
         offset = offset.view(B, 2, -1, H, W)
-        coords_h = torch.arange(H) + 0.5
-        coords_w = torch.arange(W) + 0.5
+        
+        # Use pre-computed coordinates (slice to actual size)
+        coords_h = self._coords_h[:H]
+        coords_w = self._coords_w[:W]
 
+        # Create coordinate grid using pre-computed values
         coords = (
             torch.stack(torch.meshgrid([coords_w, coords_h], indexing="ij"))
             .transpose(1, 2)
@@ -64,12 +80,12 @@ class DySample(nn.Module):
             .type(x.dtype)
             .to(x.device, non_blocking=True)
         )
-        normalizer = torch.tensor(
-            [W, H],
-            dtype=x.dtype,
-            device=x.device,
-            pin_memory=False,  # pin_memory was originally True
-        ).view(1, 2, 1, 1, 1)
+        
+        # Create normalizer more efficiently for CUDA graphs
+        # We use the coordinate values themselves to derive W and H
+        normalizer_w = coords_w[-1] + 0.5  # This equals W
+        normalizer_h = coords_h[-1] + 0.5  # This equals H
+        normalizer = torch.stack([normalizer_w, normalizer_h]).view(1, 2, 1, 1, 1)
         coords = 2 * (coords + offset) / normalizer - 1
 
         coords = (

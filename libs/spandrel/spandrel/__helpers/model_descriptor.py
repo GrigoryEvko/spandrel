@@ -394,6 +394,19 @@ class ModelBase(ABC, Generic[T]):
         self.model.train(mode)
         return self
 
+    def prepare_for_inference(self) -> Self:
+        """
+        Prepares the model for inference by setting it to evaluation mode.
+        
+        This method should be called before using the model with torch.compile
+        or CUDA graphs to ensure the model state is static.
+        
+        Returns:
+            Self: The model descriptor for method chaining.
+        """
+        self.eval()
+        return self
+
 
 class ImageModelDescriptor(ModelBase[T], Generic[T]):
     """
@@ -443,7 +456,6 @@ class ImageModelDescriptor(ModelBase[T], Generic[T]):
     def purpose(self) -> Literal["SR", "FaceSR", "Restoration"]:
         return self._purpose
 
-    @torch.inference_mode()
     def __call__(self, image: Tensor) -> Tensor:
         """
         Takes a single image tensor as input and returns a single image tensor as output.
@@ -463,10 +475,6 @@ class ImageModelDescriptor(ModelBase[T], Generic[T]):
 
         # satisfy size requirements
         did_pad, image = pad_tensor(image, self.size_requirements)
-
-        # Optimize for inference
-        if self.model.training:
-            self.model.eval()
 
         # call model
         output = self._call_fn(self.model, image)
