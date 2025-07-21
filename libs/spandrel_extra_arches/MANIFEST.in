@@ -1,0 +1,7 @@
+include README.md
+include LICENSE
+recursive-include spandrel_extra_arches *.py *.pyi
+recursive-include spandrel_extra_arches/architectures **/LICENSE
+global-exclude __pycache__
+global-exclude *.py[co]
+global-exclude .DS_Store

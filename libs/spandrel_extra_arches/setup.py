@@ -6,6 +6,21 @@ from setuptools import setup, find_packages
 setup(
     name="spandrel_extra_arches",
     version="0.2.0",
-    packages=find_packages(include=["spandrel_extra_arches*"]),
+    packages=find_packages(),
+    package_data={
+        "spandrel_extra_arches": [
+            "**/*.py",
+            "**/LICENSE",
+        ]
+    },
+    include_package_data=True,
     python_requires=">=3.8",
+    install_requires=[
+        "spandrel>=0.4.0",
+        "torch",
+        "torchvision",
+        "numpy",
+        "einops",
+        "typing_extensions",
+    ],
 )
