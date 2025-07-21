@@ -6,7 +6,6 @@ __version__ = "0.4.1"
 
 from .__helpers.canonicalize import canonicalize_state_dict
 from .__helpers.cuda_compat import (
-    compile_with_best_settings,
     make_cuda_graph_compatible,
     wrap_for_cuda_graphs,
 )
@@ -38,7 +37,6 @@ __all__ = [
     "ArchRegistry",
     "ArchSupport",
     "canonicalize_state_dict",
-    "compile_with_best_settings",
     "DuplicateArchitectureError",
     "ImageModelDescriptor",
     "MAIN_REGISTRY",

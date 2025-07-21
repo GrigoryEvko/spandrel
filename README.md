@@ -90,16 +90,16 @@ compiled_model = torch.compile(model.model, mode='reduce-overhead')
 output = compiled_model(input_tensor)
 ```
 
-For maximum compatibility, you can also use the provided utilities:
+You can also use the wrapping utility for cleaner code:
 
 ```python
-from spandrel import compile_with_best_settings, wrap_for_cuda_graphs
+from spandrel import wrap_for_cuda_graphs
 
 # Wrap the model for CUDA graphs (removes inference_mode context)
 wrapped_model = wrap_for_cuda_graphs(model)
 
-# Compile with optimized settings
-compiled = compile_with_best_settings(wrapped_model, mode='reduce-overhead')
+# Now compile with your preferred settings
+compiled = torch.compile(wrapped_model, mode='max-autotune')
 ```
 
 **Note:** Some architectures have known compatibility issues with torch.compile:

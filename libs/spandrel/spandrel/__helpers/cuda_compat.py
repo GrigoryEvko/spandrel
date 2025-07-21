@@ -77,44 +77,6 @@ def make_cuda_graph_compatible(model: ModelBase) -> ModelBase:
     return model
 
 
-def compile_with_best_settings(
-    model: torch.nn.Module,
-    mode: str = "reduce-overhead",
-    fullgraph: bool = False,
-    dynamic: bool = False,
-) -> torch.nn.Module:
-    """
-    Compile a model with settings optimized for CUDA graph compatibility.
-    
-    Args:
-        model: The PyTorch module to compile
-        mode: Compilation mode. Default is "reduce-overhead" which is more
-              compatible than "max-autotune"
-        fullgraph: Whether to require full graph capture. Default False allows
-                   graph breaks for better compatibility
-        dynamic: Whether to allow dynamic shapes. Default False for better
-                 CUDA graph compatibility
-                 
-    Returns:
-        The compiled model
-    """
-    try:
-        compiled_model = torch.compile(
-            model,
-            mode=mode,
-            fullgraph=fullgraph,
-            dynamic=dynamic,
-        )
-        return compiled_model
-    except Exception as e:
-        warnings.warn(
-            f"Failed to compile model: {e}. Returning uncompiled model.",
-            RuntimeWarning,
-            stacklevel=2
-        )
-        return model
-
-
 def wrap_for_cuda_graphs(model: ModelBase) -> torch.nn.Module:
     """
     Create a simple wrapper around a model descriptor that's optimized for CUDA graphs.
