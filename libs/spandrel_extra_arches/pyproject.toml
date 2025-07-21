@@ -1,24 +1,23 @@
 [build-system]
-requires = ["setuptools>=46.4.0"]
+requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "spandrel_extra_arches"
-authors = [{ name = "chaiNNer team" }]
-description = "Implements extra model architectures for spandrel"
-readme = "README.md"
+description = "Extra model architectures with restrictive licenses for spandrel"
+authors = [{name = "chaiNNer team"}]
+license = {text = "MIT"}
 requires-python = ">=3.8"
+dynamic = ["version"]
 keywords = [
     "spandrel",
-    "pytorch architecture",
-    "pytorch arch",
-    "model arch",
-    "model architecture",
+    "pytorch",
+    "super-resolution",
+    "restoration",
+    "image-processing",
 ]
-license = { text = "MIT" }
 classifiers = [
-    # see https://pypi.org/classifiers/
-    "Development Status :: 2 - Pre-Alpha",
+    "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Topic :: Software Development :: Libraries",
     "Programming Language :: Python :: 3",
@@ -27,22 +26,30 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3 :: Only",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "spandrel>=0.3.2",
+    "spandrel>=0.4.0",
     "torch",
     "torchvision",
     "numpy",
     "einops",
     "typing_extensions",
 ]
-dynamic = ["version"]
+
+[project.urls]
+"Homepage" = "https://github.com/chaiNNer-org/spandrel"
+"Source" = "https://github.com/chaiNNer-org/spandrel"
+"Bug Tracker" = "https://github.com/chaiNNer-org/spandrel/issues"
 
 [tool.setuptools]
 license-files = ["LICENSE"]
 
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["spandrel_extra_arches*"]
+exclude = ["tests*"]
+
 [tool.setuptools.dynamic]
-version = { attr = "spandrel_extra_arches.__version__" }
+version = {attr = "spandrel_extra_arches.__version__"}

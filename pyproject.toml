@@ -2,17 +2,10 @@
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
-[project]
-name = "spandrel"
-version = "0.4.1"
-description = "Spandrel is a library for loading and running pre-trained PyTorch models. It automatically detects the model architecture and hyperparameters from model files, and provides a unified interface for running models."
-authors = [
-    {name = "ChaiNNer", email = "chaiNNer@chaiNNer.org"},
-]
-
-[tool.setuptools.packages.find]
-where = ["libs/spandrel"]
-include = ["spandrel*"]
+# This is the root development configuration file
+# For package installation, use:
+# pip install ./libs/spandrel
+# pip install ./libs/spandrel_extra_arches
 
 [tool.ruff]
 # Same as Black.
