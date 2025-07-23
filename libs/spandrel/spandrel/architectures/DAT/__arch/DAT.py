@@ -14,29 +14,8 @@ from spandrel.util import store_hyperparameters
 from spandrel.util.timm import DropPath, trunc_normal_
 
 
-def img2windows(img, H_sp, W_sp):
-    """
-    Input: Image (B, C, H, W)
-    Output: Window Partition (B', N, C)
-    """
-    B, C, H, W = img.shape
-    img_reshape = img.view(B, C, H // H_sp, H_sp, W // W_sp, W_sp)
-    img_perm = (
-        img_reshape.permute(0, 2, 4, 3, 5, 1).contiguous().reshape(-1, H_sp * W_sp, C)
-    )
-    return img_perm
-
-
-def windows2img(img_splits_hw, H_sp, W_sp, H, W):
-    """
-    Input: Window Partition (B', N, C)
-    Output: Image (B, H, W, C)
-    """
-    B = int(img_splits_hw.shape[0] / (H * W / H_sp / W_sp))
-
-    img = img_splits_hw.view(B, H // H_sp, W // W_sp, H_sp, W_sp, -1)
-    img = img.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
-    return img
+# Import vectorized operations
+from .vectorized_ops import img2windows, windows2img, calculate_mask_vectorized, generate_position_bias
 
 
 class SpatialGate(nn.Module):
@@ -201,24 +180,10 @@ class Spatial_Attention(nn.Module):
 
         if self.position_bias:
             self.pos = DynamicPosBias(self.dim // 4, self.num_heads, residual=False)
-            # generate mother-set
-            position_bias_h = torch.arange(1 - self.H_sp, self.H_sp)
-            position_bias_w = torch.arange(1 - self.W_sp, self.W_sp)
-            biases = torch.stack(torch.meshgrid([position_bias_h, position_bias_w]))
-            biases = biases.flatten(1).transpose(0, 1).contiguous().float()
-            self.register_buffer("rpe_biases", biases)
-
-            # get pair-wise relative position index for each token inside the window
-            coords_h = torch.arange(self.H_sp)
-            coords_w = torch.arange(self.W_sp)
-            coords = torch.stack(torch.meshgrid([coords_h, coords_w]))
-            coords_flatten = torch.flatten(coords, 1)
-            relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]
-            relative_coords = relative_coords.permute(1, 2, 0).contiguous()
-            relative_coords[:, :, 0] += self.H_sp - 1
-            relative_coords[:, :, 1] += self.W_sp - 1
-            relative_coords[:, :, 0] *= 2 * self.W_sp - 1
-            relative_position_index = relative_coords.sum(-1)
+            # Use JIT-friendly position bias generation
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            rpe_biases, relative_position_index = generate_position_bias(self.H_sp, self.W_sp, device)
+            self.register_buffer("rpe_biases", rpe_biases)
             self.register_buffer("relative_position_index", relative_position_index)
 
         self.attn_drop = nn.Dropout(attn_drop)
@@ -390,83 +355,9 @@ class Adaptive_Spatial_Attention(nn.Module):
         )
 
     def calculate_mask(self, H, W):
-        # The implementation builds on Swin Transformer code https://github.com/microsoft/Swin-Transformer/blob/main/models/swin_transformer.py
-        # calculate attention mask for shift window
-        img_mask_0 = torch.zeros((1, H, W, 1))  # 1 H W 1 idx=0
-        img_mask_1 = torch.zeros((1, H, W, 1))  # 1 H W 1 idx=1
-        h_slices_0 = (
-            slice(0, -self.split_size[0]),
-            slice(-self.split_size[0], -self.shift_size[0]),
-            slice(-self.shift_size[0], None),
-        )
-        w_slices_0 = (
-            slice(0, -self.split_size[1]),
-            slice(-self.split_size[1], -self.shift_size[1]),
-            slice(-self.shift_size[1], None),
-        )
-
-        h_slices_1 = (
-            slice(0, -self.split_size[1]),
-            slice(-self.split_size[1], -self.shift_size[1]),
-            slice(-self.shift_size[1], None),
-        )
-        w_slices_1 = (
-            slice(0, -self.split_size[0]),
-            slice(-self.split_size[0], -self.shift_size[0]),
-            slice(-self.shift_size[0], None),
-        )
-        cnt = 0
-        for h in h_slices_0:
-            for w in w_slices_0:
-                img_mask_0[:, h, w, :] = cnt
-                cnt += 1
-        cnt = 0
-        for h in h_slices_1:
-            for w in w_slices_1:
-                img_mask_1[:, h, w, :] = cnt
-                cnt += 1
-
-        # calculate mask for window-0
-        img_mask_0 = img_mask_0.view(
-            1,
-            H // self.split_size[0],
-            self.split_size[0],
-            W // self.split_size[1],
-            self.split_size[1],
-            1,
-        )
-        img_mask_0 = (
-            img_mask_0.permute(0, 1, 3, 2, 4, 5)
-            .contiguous()
-            .view(-1, self.split_size[0], self.split_size[1], 1)
-        )  # nW, sw[0], sw[1], 1
-        mask_windows_0 = img_mask_0.view(-1, self.split_size[0] * self.split_size[1])
-        attn_mask_0 = mask_windows_0.unsqueeze(1) - mask_windows_0.unsqueeze(2)
-        attn_mask_0 = attn_mask_0.masked_fill(attn_mask_0 != 0, -100.0).masked_fill(
-            attn_mask_0 == 0, 0.0
-        )
-
-        # calculate mask for window-1
-        img_mask_1 = img_mask_1.view(
-            1,
-            H // self.split_size[1],
-            self.split_size[1],
-            W // self.split_size[0],
-            self.split_size[0],
-            1,
-        )
-        img_mask_1 = (
-            img_mask_1.permute(0, 1, 3, 2, 4, 5)
-            .contiguous()
-            .view(-1, self.split_size[1], self.split_size[0], 1)
-        )  # nW, sw[1], sw[0], 1
-        mask_windows_1 = img_mask_1.view(-1, self.split_size[1] * self.split_size[0])
-        attn_mask_1 = mask_windows_1.unsqueeze(1) - mask_windows_1.unsqueeze(2)
-        attn_mask_1 = attn_mask_1.masked_fill(attn_mask_1 != 0, -100.0).masked_fill(
-            attn_mask_1 == 0, 0.0
-        )
-
-        return attn_mask_0, attn_mask_1
+        # Use vectorized implementation for better GPU utilization
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        return calculate_mask_vectorized(H, W, self.split_size, self.shift_size, device)
 
     def forward(self, x, H, W):
         """

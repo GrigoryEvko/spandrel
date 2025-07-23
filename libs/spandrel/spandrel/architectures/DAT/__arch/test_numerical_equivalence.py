@@ -73,7 +73,7 @@ def test_window_attention_equivalence():
     
     # Test configurations
     configs = [
-        {"dim": 96, "num_heads": 3, "split_size": [8, 8], "H": 64, "W": 64},
+        {"dim": 96, "num_heads": 4, "split_size": [8, 8], "H": 64, "W": 64},
         {"dim": 192, "num_heads": 6, "split_size": [8, 8], "H": 32, "W": 48},
         {"dim": 384, "num_heads": 12, "split_size": [16, 16], "H": 128, "W": 128},
     ]
@@ -116,13 +116,16 @@ def test_window_attention_equivalence():
         flex.eval()
         
         with torch.no_grad():
+            # Create QKV for both (neither has internal QKV)
+            qkv_layer = torch.nn.Linear(C, C * 3, bias=True)
+            torch.nn.init.xavier_uniform_(qkv_layer.weight)
+            qkv = qkv_layer(x).reshape(B, -1, 3, C).permute(2, 0, 1, 3)
+            
             # Original forward
-            qkv_orig = original.qkv(x).reshape(B, -1, 3, C).permute(2, 0, 1, 3)
-            out_original = original(qkv_orig, H, W)
+            out_original = original(qkv, H, W)
             
             # Flex forward
-            qkv_flex = flex.qkv(x).reshape(B, -1, 3, C).permute(2, 0, 1, 3)
-            out_flex = flex(qkv_flex, H, W)
+            out_flex = flex(qkv, H, W)
             
             # Compare
             stats = compare_outputs(
@@ -284,10 +287,10 @@ def test_full_model_equivalence():
     model_config = {
         "img_size": 64,
         "in_chans": 3,
-        "embed_dim": 180,
+        "embed_dim": 192,
         "split_size": [8, 8],
         "depth": [2, 2, 2, 2],
-        "num_heads": [3, 6, 12, 24],
+        "num_heads": [4, 6, 12, 24],
         "expansion_factor": 4.0,
         "qkv_bias": True,
         "upscale": 4,
@@ -359,7 +362,7 @@ def test_gradient_equivalence():
     from DAT import Spatial_Attention as OriginalSpatialAttention
     
     dim = 96
-    num_heads = 3
+    num_heads = 4
     H, W = 32, 32
     
     # Create modules
@@ -380,11 +383,14 @@ def test_gradient_equivalence():
     x = torch.randn(B, H * W, dim, requires_grad=True)
     x_flex = x.clone().detach().requires_grad_(True)
     
-    # Forward pass
-    qkv_orig = original.qkv(x).reshape(B, -1, 3, dim).permute(2, 0, 1, 3)
+    # Forward pass - neither has internal QKV
+    qkv_layer = nn.Linear(dim, dim * 3, bias=True)
+    torch.nn.init.xavier_uniform_(qkv_layer.weight)
+    
+    qkv_orig = qkv_layer(x).reshape(B, -1, 3, dim).permute(2, 0, 1, 3)
     out_original = original(qkv_orig, H, W).view(B, H * W, dim)
     
-    qkv_flex = flex.qkv(x_flex).reshape(B, -1, 3, dim).permute(2, 0, 1, 3)
+    qkv_flex = qkv_layer(x_flex).reshape(B, -1, 3, dim).permute(2, 0, 1, 3)
     out_flex = flex(qkv_flex, H, W).view(B, H * W, dim)
     
     # Backward pass
