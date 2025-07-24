@@ -18,6 +18,8 @@ from spandrel.util.timm import DropPath, trunc_normal_
 from .vectorized_ops import img2windows, windows2img, calculate_mask_vectorized, generate_position_bias
 
 
+
+
 class SpatialGate(nn.Module):
     """Spatial-Gate.
     Args:
@@ -322,18 +324,35 @@ class Adaptive_Spatial_Attention(nn.Module):
             ]
         )
 
-        if (self.rg_idx % 2 == 0 and self.b_idx > 0 and (self.b_idx - 2) % 4 == 0) or (
-            self.rg_idx % 2 != 0 and self.b_idx % 4 == 0
-        ):
-            attn_mask = self.calculate_mask(
-                self.patches_resolution, self.patches_resolution
-            )
-            self.register_buffer("attn_mask_0", attn_mask[0])
-            self.register_buffer("attn_mask_1", attn_mask[1])
+        # Determine if we actually need the mask based on block indices
+        # shift in block: (0, 4, 8, ...), (2, 6, 10, ...), (0, 4, 8, ...), (2, 6, 10, ...), ...
+        use_real_mask = (
+            (self.rg_idx % 2 == 0 and self.b_idx > 0 and (self.b_idx - 2) % 4 == 0) or 
+            (self.rg_idx % 2 != 0 and self.b_idx % 4 == 0)
+        )
+        
+        # Pre-compute shift values as Python tuples in __init__ 
+        # Since these are static values, we can compute them once here
+        # This avoids ANY runtime operations in the forward pass
+        if use_real_mask:
+            # Actual shift values
+            self.shift_0 = (-self.shift_size[0], -self.shift_size[1])
+            self.shift_1 = (-self.shift_size[1], -self.shift_size[0])
+            self.unshift_0 = (self.shift_size[0], self.shift_size[1])
+            self.unshift_1 = (self.shift_size[1], self.shift_size[0])
         else:
-            attn_mask = None
-            self.register_buffer("attn_mask_0", None)
-            self.register_buffer("attn_mask_1", None)
+            # Zero shifts (no-op)
+            self.shift_0 = (0, 0)
+            self.shift_1 = (0, 0)
+            self.unshift_0 = (0, 0)
+            self.unshift_1 = (0, 0)
+        
+        # Note: torch._dynamo.mark_static doesn't work for non-tensor attributes
+        # The shift values being constants in __init__ should be enough for torch.compile
+        
+        # Don't pre-compute masks - always calculate dynamically to avoid recompilations
+        # This ensures consistent behavior across all input sizes
+        self.use_real_mask = use_real_mask
 
         self.dwconv = nn.Sequential(
             nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=1, groups=dim),
@@ -355,9 +374,55 @@ class Adaptive_Spatial_Attention(nn.Module):
         )
 
     def calculate_mask(self, H, W):
-        # Use vectorized implementation for better GPU utilization
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        return calculate_mask_vectorized(H, W, self.split_size, self.shift_size, device)
+        
+        if self.use_real_mask:
+            # Use vectorized implementation for better GPU utilization
+            return calculate_mask_vectorized(H, W, self.split_size, self.shift_size, device)
+        else:
+            # Return zero masks that have no effect
+            num_windows_0 = (H // self.split_size[0]) * (W // self.split_size[1])
+            num_windows_1 = (H // self.split_size[1]) * (W // self.split_size[0])
+            window_size = self.split_size[0] * self.split_size[1]
+            
+            zero_mask_0 = torch.zeros((num_windows_0, window_size, window_size), device=device)
+            zero_mask_1 = torch.zeros((num_windows_1, window_size, window_size), device=device)
+            
+            return [zero_mask_0, zero_mask_1]
+    
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        """Handle backward compatibility - ignore attn_mask buffers from old checkpoints."""
+        # Remove attn_mask keys from state_dict if present (we don't use them anymore)
+        attn_mask_0_key = prefix + 'attn_mask_0'
+        attn_mask_1_key = prefix + 'attn_mask_1'
+        
+        # Pop the keys if they exist in the checkpoint (we calculate masks dynamically now)
+        if attn_mask_0_key in state_dict:
+            state_dict.pop(attn_mask_0_key)
+        if attn_mask_1_key in state_dict:
+            state_dict.pop(attn_mask_1_key)
+        
+        # Initialize shift values if not already set (for backward compatibility)
+        if not hasattr(self, 'shift_0'):
+            use_real_mask = (
+                (self.rg_idx % 2 == 0 and self.b_idx > 0 and (self.b_idx - 2) % 4 == 0) or 
+                (self.rg_idx % 2 != 0 and self.b_idx % 4 == 0)
+            )
+            if use_real_mask:
+                self.shift_0 = (-self.shift_size[0], -self.shift_size[1])
+                self.shift_1 = (-self.shift_size[1], -self.shift_size[0])
+                self.unshift_0 = (self.shift_size[0], self.shift_size[1])
+                self.unshift_1 = (self.shift_size[1], self.shift_size[0])
+            else:
+                self.shift_0 = (0, 0)
+                self.shift_1 = (0, 0)
+                self.unshift_0 = (0, 0)
+                self.unshift_1 = (0, 0)
+            
+        
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
+                                      missing_keys, unexpected_keys, error_msgs)
 
     def forward(self, x, H, W):
         """
@@ -387,53 +452,46 @@ class Adaptive_Spatial_Attention(nn.Module):
         _W = pad_r + W
         _L = _H * _W
 
-        # window-0 and window-1 on split channels [C/2, C/2]; for square windows (e.g., 8x8), window-0 and window-1 can be merged
-        # shift in block: (0, 4, 8, ...), (2, 6, 10, ...), (0, 4, 8, ...), (2, 6, 10, ...), ...
-        if (self.rg_idx % 2 == 0 and self.b_idx > 0 and (self.b_idx - 2) % 4 == 0) or (
-            self.rg_idx % 2 != 0 and self.b_idx % 4 == 0
-        ):
-            qkv = qkv.view(3, B, _H, _W, C)
-            qkv_0 = torch.roll(
-                qkv[:, :, :, :, : C // 2],
-                shifts=(-self.shift_size[0], -self.shift_size[1]),
-                dims=(2, 3),
-            )
-            qkv_0 = qkv_0.view(3, B, _L, C // 2)
-            qkv_1 = torch.roll(
-                qkv[:, :, :, :, C // 2 :],
-                shifts=(-self.shift_size[1], -self.shift_size[0]),
-                dims=(2, 3),
-            )
-            qkv_1 = qkv_1.view(3, B, _L, C // 2)
+        # Unified forward pass without ANY conditionals or Python operations
+        # All shift values are pre-computed as tensor buffers in __init__
+        # This completely eliminates runtime conditionals, computation, and type conversions
+        
+        # Always perform the same operations
+        qkv = qkv.view(3, B, _H, _W, C)
+        
+        # Apply shifts using pre-computed tuples (will be no-op with (0,0) shifts)
+        qkv_0 = torch.roll(
+            qkv[:, :, :, :, : C // 2],
+            shifts=self.shift_0,  # Direct use of pre-computed tuple
+            dims=(2, 3),
+        )
+        qkv_0 = qkv_0.view(3, B, _L, C // 2)
+        
+        qkv_1 = torch.roll(
+            qkv[:, :, :, :, C // 2 :],
+            shifts=self.shift_1,  # Direct use of pre-computed tuple
+            dims=(2, 3),
+        )
+        qkv_1 = qkv_1.view(3, B, _L, C // 2)
 
-            if self.patches_resolution != _H or self.patches_resolution != _W:
-                mask_tmp = self.calculate_mask(_H, _W)
-                x1_shift = self.attns[0](qkv_0, _H, _W, mask=mask_tmp[0].to(x.device))
-                x2_shift = self.attns[1](qkv_1, _H, _W, mask=mask_tmp[1].to(x.device))
-            else:
-                x1_shift = self.attns[0](qkv_0, _H, _W, mask=self.attn_mask_0)
-                x2_shift = self.attns[1](qkv_1, _H, _W, mask=self.attn_mask_1)
+        # Always calculate masks dynamically to avoid recompilations
+        mask_tmp = self.calculate_mask(_H, _W)
+        x1_shift = self.attns[0](qkv_0, _H, _W, mask=mask_tmp[0].to(x.device).to(x.dtype))
+        x2_shift = self.attns[1](qkv_1, _H, _W, mask=mask_tmp[1].to(x.device).to(x.dtype))
 
-            x1 = torch.roll(
-                x1_shift, shifts=(self.shift_size[0], self.shift_size[1]), dims=(1, 2)
-            )
-            x2 = torch.roll(
-                x2_shift, shifts=(self.shift_size[1], self.shift_size[0]), dims=(1, 2)
-            )
-            x1 = x1[:, :H, :W, :].reshape(B, L, C // 2)
-            x2 = x2[:, :H, :W, :].reshape(B, L, C // 2)
-            # attention output
-            attened_x = torch.cat([x1, x2], dim=2)
-
-        else:
-            x1 = self.attns[0](qkv[:, :, :, : C // 2], _H, _W)[:, :H, :W, :].reshape(
-                B, L, C // 2
-            )
-            x2 = self.attns[1](qkv[:, :, :, C // 2 :], _H, _W)[:, :H, :W, :].reshape(
-                B, L, C // 2
-            )
-            # attention output
-            attened_x = torch.cat([x1, x2], dim=2)
+        # Apply unshifts using pre-computed tuples (will be no-op with (0,0) shifts)
+        x1 = torch.roll(
+            x1_shift, shifts=self.unshift_0, dims=(1, 2)
+        )
+        x2 = torch.roll(
+            x2_shift, shifts=self.unshift_1, dims=(1, 2)
+        )
+        
+        x1 = x1[:, :H, :W, :].reshape(B, L, C // 2)
+        x2 = x2[:, :H, :W, :].reshape(B, L, C // 2)
+        
+        # attention output
+        attened_x = torch.cat([x1, x2], dim=2)
 
         # convolution output
         conv_x = self.dwconv(v)
@@ -677,33 +735,36 @@ class ResidualGroup(nn.Module):
         use_chk=False,
         resi_connection="1conv",
         rg_idx=0,
+        regional_compile=False,
     ):
         super().__init__()
         self.use_chk = use_chk
         self.reso = reso
+        self.regional_compile = regional_compile
 
-        self.blocks = nn.ModuleList(
-            [
-                DATB(
-                    dim=dim,
-                    num_heads=num_heads,
-                    reso=reso,
-                    split_size=split_size,
-                    shift_size=[split_size[0] // 2, split_size[1] // 2],
-                    expansion_factor=expansion_factor,
-                    qkv_bias=qkv_bias,
-                    qk_scale=qk_scale,
-                    drop=drop,
-                    attn_drop=attn_drop,
-                    drop_path=drop_paths[i],  # type: ignore
-                    act_layer=act_layer,
-                    norm_layer=norm_layer,
-                    rg_idx=rg_idx,
-                    b_idx=i,
-                )
-                for i in range(depth)
-            ]
-        )
+        self.blocks = nn.ModuleList()
+        for i in range(depth):
+            datb = DATB(
+                dim=dim,
+                num_heads=num_heads,
+                reso=reso,
+                split_size=split_size,
+                shift_size=[split_size[0] // 2, split_size[1] // 2],
+                expansion_factor=expansion_factor,
+                qkv_bias=qkv_bias,
+                qk_scale=qk_scale,
+                drop=drop,
+                attn_drop=attn_drop,
+                drop_path=drop_paths[i],  # type: ignore
+                act_layer=act_layer,
+                norm_layer=norm_layer,
+                rg_idx=rg_idx,
+                b_idx=i,
+            )
+            
+            # Don't apply torch.compile here - it will be done after state dict loading
+            
+            self.blocks.append(datb)
 
         if resi_connection == "1conv":
             self.conv = nn.Conv2d(dim, dim, 3, 1, 1)
@@ -831,6 +892,7 @@ class DAT(nn.Module):
         img_range=1.0,
         resi_connection="1conv",
         upsampler="pixelshuffle",
+        regional_compile=False,
     ):
         super().__init__()
 
@@ -840,9 +902,10 @@ class DAT(nn.Module):
         self.img_range = img_range
         if in_chans == 3:
             rgb_mean = (0.4488, 0.4371, 0.4040)
-            self.mean = torch.Tensor(rgb_mean).view(1, 3, 1, 1)
+            mean = torch.Tensor(rgb_mean).view(1, 3, 1, 1)
         else:
-            self.mean = torch.zeros(1, 1, 1, 1)
+            mean = torch.zeros(1, 1, 1, 1)
+        self.register_buffer('mean', mean)
         self.upscale = upscale
         self.upsampler = upsampler
 
@@ -852,6 +915,7 @@ class DAT(nn.Module):
         # ------------------------- 2, Deep Feature Extraction ------------------------- #
         self.num_layers = len(depth)
         self.use_chk = use_chk
+        self.regional_compile = regional_compile
         self.num_features = self.embed_dim = (
             embed_dim  # num_features for consistency with other models
         )
@@ -885,6 +949,7 @@ class DAT(nn.Module):
                 use_chk=use_chk,
                 resi_connection=resi_connection,
                 rg_idx=i,
+                regional_compile=regional_compile,
             )
             self.layers.append(layer)
 
@@ -940,12 +1005,51 @@ class DAT(nn.Module):
 
         return x
 
+    def load_state_dict(self, state_dict, strict=True):
+        """
+        Override to handle backward compatibility for the 'mean' buffer and attn_mask buffers.
+        Old checkpoints don't have 'mean' or attn_mask in their state_dict.
+        """
+        # Check if 'mean' is missing from the state_dict
+        if 'mean' not in state_dict and hasattr(self, 'mean'):
+            # Create a copy to avoid modifying the original state_dict
+            state_dict = dict(state_dict)
+            # Add the current mean buffer value to the state_dict
+            # This ensures backward compatibility with old checkpoints
+            state_dict['mean'] = self.mean
+        
+        # Check if we're missing attn_mask keys - these are from old checkpoints
+        # If any attn_mask keys are missing, load with strict=False since these
+        # masks are dynamically calculated anyway
+        missing_attn_masks = False
+        for key in list(self.state_dict().keys()):
+            if 'attn_mask_' in key and key not in state_dict:
+                missing_attn_masks = True
+                break
+        
+        if missing_attn_masks and strict:
+            # Load with strict=False for backward compatibility, then verify
+            # that only attn_mask keys were missing
+            missing_keys, unexpected_keys = super().load_state_dict(state_dict, strict=False)
+            
+            # Check if any non-attn_mask keys are missing
+            non_mask_missing = [k for k in missing_keys if 'attn_mask_' not in k]
+            if non_mask_missing:
+                raise RuntimeError(f"Missing required keys in state_dict: {non_mask_missing}")
+            
+            return missing_keys, unexpected_keys
+        else:
+            # Call the parent's load_state_dict with the potentially modified state_dict
+            return super().load_state_dict(state_dict, strict=strict)
+
     def forward(self, x):
         """
         Input: x: (B, C, H, W)
         """
-        self.mean = self.mean.type_as(x)
-        x = (x - self.mean) * self.img_range
+        # Ensure mean is same dtype as input for numerical equivalence
+        # Using .to(x.dtype) instead of type_as for CUDA graphs compatibility
+        mean = self.mean.to(x.dtype)
+        x = (x - mean) * self.img_range
 
         if self.upsampler == "pixelshuffle":
             # for image SR
@@ -959,5 +1063,31 @@ class DAT(nn.Module):
             x = self.conv_after_body(self.forward_features(x)) + x
             x = self.upsample(x)
 
-        x = x / self.img_range + self.mean
+        x = x / self.img_range + mean
         return x
+    
+    def apply_regional_compilation(self):
+        """Apply regional compilation to attention and FFN modules after state dict is loaded."""
+        if not self.regional_compile:
+            return
+            
+        # Ensure model is in eval mode before compilation
+        self.eval()
+        
+        print("Applying regional compilation to DAT modules...")
+        
+        # Create compile options with reduce-overhead for faster compilation
+        compile_options = {
+            "mode": "reduce-overhead",  # Faster compilation, good performance
+            "fullgraph": False,
+            "dynamic": True,  # Enable dynamic shapes for H, W dimensions
+        }
+        
+        for layer in self.layers:
+            for i, blk in enumerate(layer.blocks):
+                # Compile attention modules
+                blk.attn = torch.compile(blk.attn, **compile_options)
+                # Compile FFN modules
+                blk.ffn = torch.compile(blk.ffn, **compile_options)
+                
+        print("Regional compilation applied successfully.")

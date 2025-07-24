@@ -227,16 +227,14 @@ def windows2img(img_splits_hw: torch.Tensor, H_sp: int, W_sp: int, H: int, W: in
         W: Width of image
     
     Returns:
-        img: (B, C, H, W)
+        img: (B, H, W, C)
     """
     # JIT-friendly batch size calculation
     num_windows = (H // H_sp) * (W // W_sp)
     B = img_splits_hw.shape[0] // num_windows
-    C = img_splits_hw.shape[2]
     
-    img_splits_hw = img_splits_hw.view(B, H // H_sp, W // W_sp, H_sp, W_sp, C)
-    img = img_splits_hw.permute(0, 5, 1, 3, 2, 4).contiguous()
-    img = img.view(B, C, H, W)
+    img = img_splits_hw.view(B, H // H_sp, W // W_sp, H_sp, W_sp, -1)
+    img = img.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
     return img
 
 
