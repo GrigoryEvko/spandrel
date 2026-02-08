@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import math
 
 import numpy as np
@@ -13,11 +14,15 @@ from torch.nn import functional as F
 from spandrel.util import store_hyperparameters
 from spandrel.util.timm import DropPath, trunc_normal_
 
-
 # Import vectorized operations
-from .vectorized_ops import img2windows, windows2img, calculate_mask_vectorized, generate_position_bias
+from .vectorized_ops import (
+    calculate_mask_vectorized,
+    generate_position_bias,
+    img2windows,
+    windows2img,
+)
 
-
+logger = logging.getLogger(__name__)
 
 
 class SpatialGate(nn.Module):
@@ -182,9 +187,10 @@ class Spatial_Attention(nn.Module):
 
         if self.position_bias:
             self.pos = DynamicPosBias(self.dim // 4, self.num_heads, residual=False)
-            # Use JIT-friendly position bias generation
-            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-            rpe_biases, relative_position_index = generate_position_bias(self.H_sp, self.W_sp, device)
+            # Generate on CPU — register_buffer moves with model.to(device)
+            rpe_biases, relative_position_index = generate_position_bias(
+                self.H_sp, self.W_sp, torch.device("cpu")
+            )
             self.register_buffer("rpe_biases", rpe_biases)
             self.register_buffer("relative_position_index", relative_position_index)
 
@@ -209,7 +215,6 @@ class Spatial_Attention(nn.Module):
         q, k, v = qkv[0], qkv[1], qkv[2]
 
         B, L, C = q.shape
-        assert L == H * W, "flatten img_tokens has wrong size"
 
         # partition the q,k,v, image to window
         q = self.im2win(q, H, W)
@@ -327,11 +332,11 @@ class Adaptive_Spatial_Attention(nn.Module):
         # Determine if we actually need the mask based on block indices
         # shift in block: (0, 4, 8, ...), (2, 6, 10, ...), (0, 4, 8, ...), (2, 6, 10, ...), ...
         use_real_mask = (
-            (self.rg_idx % 2 == 0 and self.b_idx > 0 and (self.b_idx - 2) % 4 == 0) or 
+            (self.rg_idx % 2 == 0 and self.b_idx > 0 and (self.b_idx - 2) % 4 == 0) or
             (self.rg_idx % 2 != 0 and self.b_idx % 4 == 0)
         )
-        
-        # Pre-compute shift values as Python tuples in __init__ 
+
+        # Pre-compute shift values as Python tuples in __init__
         # Since these are static values, we can compute them once here
         # This avoids ANY runtime operations in the forward pass
         if use_real_mask:
@@ -346,10 +351,10 @@ class Adaptive_Spatial_Attention(nn.Module):
             self.shift_1 = (0, 0)
             self.unshift_0 = (0, 0)
             self.unshift_1 = (0, 0)
-        
+
         # Note: torch._dynamo.mark_static doesn't work for non-tensor attributes
         # The shift values being constants in __init__ should be enough for torch.compile
-        
+
         # Don't pre-compute masks - always calculate dynamically to avoid recompilations
         # This ensures consistent behavior across all input sizes
         self.use_real_mask = use_real_mask
@@ -373,21 +378,15 @@ class Adaptive_Spatial_Attention(nn.Module):
             nn.Conv2d(dim // 16, 1, kernel_size=1),
         )
 
-    def calculate_mask(self, H, W):
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
+    def calculate_mask(self, H, W, device):
         if self.use_real_mask:
-            # Use vectorized implementation for better GPU utilization
             return calculate_mask_vectorized(H, W, self.split_size, self.shift_size, device)
         else:
-            # Return zero masks that have no effect
             num_windows_0 = (H // self.split_size[0]) * (W // self.split_size[1])
             num_windows_1 = (H // self.split_size[1]) * (W // self.split_size[0])
             window_size = self.split_size[0] * self.split_size[1]
-
             zero_mask_0 = torch.zeros((num_windows_0, window_size, window_size), device=device)
             zero_mask_1 = torch.zeros((num_windows_1, window_size, window_size), device=device)
-
             return [zero_mask_0, zero_mask_1]
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
@@ -430,7 +429,6 @@ class Adaptive_Spatial_Attention(nn.Module):
         Output: x: (B, H*W, C)
         """
         B, L, C = x.shape
-        assert L == H * W, "flatten img_tokens has wrong size"
 
         qkv = self.qkv(x).reshape(B, -1, 3, C).permute(2, 0, 1, 3)  # 3, B, HW, C
         # V without partition
@@ -455,10 +453,10 @@ class Adaptive_Spatial_Attention(nn.Module):
         # Unified forward pass without ANY conditionals or Python operations
         # All shift values are pre-computed as tensor buffers in __init__
         # This completely eliminates runtime conditionals, computation, and type conversions
-        
+
         # Always perform the same operations
         qkv = qkv.view(3, B, _H, _W, C)
-        
+
         # Apply shifts using pre-computed tuples (will be no-op with (0,0) shifts)
         qkv_0 = torch.roll(
             qkv[:, :, :, :, : C // 2],
@@ -466,7 +464,7 @@ class Adaptive_Spatial_Attention(nn.Module):
             dims=(2, 3),
         )
         qkv_0 = qkv_0.view(3, B, _L, C // 2)
-        
+
         qkv_1 = torch.roll(
             qkv[:, :, :, :, C // 2 :],
             shifts=self.shift_1,  # Direct use of pre-computed tuple
@@ -474,10 +472,10 @@ class Adaptive_Spatial_Attention(nn.Module):
         )
         qkv_1 = qkv_1.view(3, B, _L, C // 2)
 
-        # Always calculate masks dynamically to avoid recompilations
-        mask_tmp = self.calculate_mask(_H, _W)
-        x1_shift = self.attns[0](qkv_0, _H, _W, mask=mask_tmp[0].to(x.device).to(x.dtype))
-        x2_shift = self.attns[1](qkv_1, _H, _W, mask=mask_tmp[1].to(x.device).to(x.dtype))
+        # Calculate masks dynamically (JIT-scripted, fast for fixed tile sizes)
+        mask_tmp = self.calculate_mask(_H, _W, x.device)
+        x1_shift = self.attns[0](qkv_0, _H, _W, mask=mask_tmp[0].to(dtype=x.dtype))
+        x2_shift = self.attns[1](qkv_1, _H, _W, mask=mask_tmp[1].to(dtype=x.dtype))
 
         # Apply unshifts using pre-computed tuples (will be no-op with (0,0) shifts)
         x1 = torch.roll(
@@ -486,10 +484,10 @@ class Adaptive_Spatial_Attention(nn.Module):
         x2 = torch.roll(
             x2_shift, shifts=self.unshift_1, dims=(1, 2)
         )
-        
+
         x1 = x1[:, :H, :W, :].reshape(B, L, C // 2)
         x2 = x2[:, :H, :W, :].reshape(B, L, C // 2)
-        
+
         # attention output
         attened_x = torch.cat([x1, x2], dim=2)
 
@@ -761,9 +759,9 @@ class ResidualGroup(nn.Module):
                 rg_idx=rg_idx,
                 b_idx=i,
             )
-            
+
             # Don't apply torch.compile here - it will be done after state dict loading
-            
+
             self.blocks.append(datb)
 
         if resi_connection == "1conv":
@@ -1017,7 +1015,7 @@ class DAT(nn.Module):
             # Add the current mean buffer value to the state_dict
             # This ensures backward compatibility with old checkpoints
             state_dict['mean'] = self.mean
-        
+
         # Check if we're missing attn_mask keys - these are from old checkpoints
         # If any attn_mask keys are missing, load with strict=False since these
         # masks are dynamically calculated anyway
@@ -1026,17 +1024,17 @@ class DAT(nn.Module):
             if 'attn_mask_' in key and key not in state_dict:
                 missing_attn_masks = True
                 break
-        
+
         if missing_attn_masks and strict:
             # Load with strict=False for backward compatibility, then verify
             # that only attn_mask keys were missing
             missing_keys, unexpected_keys = super().load_state_dict(state_dict, strict=False)
-            
+
             # Check if any non-attn_mask keys are missing
             non_mask_missing = [k for k in missing_keys if 'attn_mask_' not in k]
             if non_mask_missing:
                 raise RuntimeError(f"Missing required keys in state_dict: {non_mask_missing}")
-            
+
             return missing_keys, unexpected_keys
         else:
             # Call the parent's load_state_dict with the potentially modified state_dict
@@ -1065,29 +1063,29 @@ class DAT(nn.Module):
 
         x = x / self.img_range + mean
         return x
-    
+
     def apply_regional_compilation(self):
         """Apply regional compilation to attention and FFN modules after state dict is loaded."""
         if not self.regional_compile:
             return
-            
+
         # Ensure model is in eval mode before compilation
         self.eval()
-        
-        print("Applying regional compilation to DAT modules...")
-        
+
+        logger.info("Applying regional compilation to DAT modules...")
+
         # Create compile options with reduce-overhead for faster compilation
         compile_options = {
             "mode": "reduce-overhead",  # Faster compilation, good performance
             "fullgraph": False,
             "dynamic": True,  # Enable dynamic shapes for H, W dimensions
         }
-        
+
         for layer in self.layers:
             for i, blk in enumerate(layer.blocks):
                 # Compile attention modules
                 blk.attn = torch.compile(blk.attn, **compile_options)
                 # Compile FFN modules
                 blk.ffn = torch.compile(blk.ffn, **compile_options)
-                
-        print("Regional compilation applied successfully.")
+
+        logger.info("Regional compilation applied successfully.")
